@@ -24,11 +24,6 @@ from services.route_service import _classify, _extract_job_distances, generate_p
 
 # folium's default marker icons use Font Awesome 4 names, not "warehouse"/"box" (FA5+).
 STOP_ICONS = {"origin": ("green", "home"), "drop": ("blue", "cube"), "end": ("red", "home")}
-GROUP_LABELS = {
-    0: "Time-critical (window or deadline)",
-    1: "Start-only (no deadline)",
-    2: "No time constraint",
-}
 PAGES = ["🏭 Warehouse & Deliveries", "📋 Prioritized Route", "🔍 Geoapify Response", "🗺️ Map"]
 
 st.set_page_config(page_title="Shipment Route Prioritizer", page_icon="📦", layout="wide")
@@ -59,6 +54,23 @@ def format_time_window(shipment):
         return "No constraint"
     start, end = time_window.get("start", "—"), time_window.get("end", "—")
     return f"{start} - {end}"
+
+
+def extract_job_times(geoapify_response):
+    """Map each job's id to its arrival time (seconds since route start), read
+    directly off its action - Geoapify already computes this per job, no
+    summation needed (unlike distance, which only has per-leg values).
+    UI-only helper, kept here rather than in route_service.py.
+    """
+    times = {}
+    try:
+        actions = geoapify_response["features"][0]["properties"].get("actions", [])
+        for action in actions:
+            if action.get("type") == "job" and "job_id" in action:
+                times[action["job_id"]] = action.get("start_time", 0)
+    except (KeyError, IndexError, TypeError):
+        pass
+    return times
 
 
 def _describe_shipment(shipment):
@@ -174,7 +186,7 @@ elif page == "📋 Prioritized Route":
     else:
         col1, col2 = st.columns(2)
         col1.metric("Total distance", f"{result['total_miles']} mi")
-        col2.metric("Total drive time", result["total_duration"])
+        col2.metric("Estimated travel time", result["total_duration"])
 
         shipments_by_id = {s["shipment_id"]: s for s in SAMPLE_SHIPMENTS}
         sorted_shipments = [
@@ -215,22 +227,17 @@ elif page == "🔍 Geoapify Response":
     if not geoapify_response:
         st.info("Click **Generate Prioritized Route** in the sidebar to see Geoapify's response here.")
     else:
-        st.caption(
-            "Why each delivery landed where it did: its priority category and "
-            "how far along the Geoapify-computed route it sits."
-        )
+        st.caption("Distance and time exactly as Geoapify's Route Planner returned them, per shipment.")
         job_distances = _extract_job_distances(geoapify_response)
+        job_times = extract_job_times(geoapify_response)
         detail_rows = []
         for shipment in SAMPLE_SHIPMENTS:
-            group, _, _ = _classify(shipment)
-            distance_m = job_distances.get(shipment["shipment_id"])
             detail_rows.append(
                 {
                     "Shipment ID": shipment["shipment_id"],
                     "Address": shipment["address"],
-                    "Time Window": format_time_window(shipment),
-                    "Priority Category": GROUP_LABELS[group],
-                    "Geoapify Distance (mi)": round(distance_m / 1609.344, 2) if distance_m is not None else None,
+                    "Distance (m)": job_distances.get(shipment["shipment_id"]),
+                    "Time (s)": job_times.get(shipment["shipment_id"]),
                 }
             )
         st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
