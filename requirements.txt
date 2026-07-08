@@ -1,0 +1,8 @@
+requests==2.32.3
+python-dotenv==1.0.1
+
+# Demo UI (app.py) only - not required to use the core pipeline via main.py
+streamlit==1.38.0
+pandas==2.2.2
+folium==0.17.0
+streamlit-folium==0.22.1
