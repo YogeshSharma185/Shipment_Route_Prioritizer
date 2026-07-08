@@ -81,9 +81,7 @@ streamlit run app.py
 ```
 
 This opens a dashboard with a sidebar action and four pages you switch
-between instantly (a radio switch, not `st.tabs` - see the note in
-`app.py`'s docstring for why: `st.tabs` builds every tab's content on every
-run, which breaks map rendering when the map's tab starts out hidden):
+between instantly:
 
 - **Sidebar** - one button, **Generate Prioritized Route**, which runs the
   exact same `get_geoapify_route()` -> `generate_prioritized_route()`
