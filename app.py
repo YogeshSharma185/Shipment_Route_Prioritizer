@@ -24,7 +24,7 @@ from services.route_service import _classify_window, generate_prioritized_route
 
 # folium's default marker icons use Font Awesome 4 names, not "warehouse"/"box" (FA5+).
 STOP_ICONS = {"pickup": ("purple", "arrow-up"), "delivery": ("blue", "cube")}
-PAGES = ["🏭 Shipments", "📋 Prioritized Route", "🔍 Travel Matrix", "🗺️ Map"]
+PAGES = ["🏭 Shipments", "📋 Prioritized Route", "🔍 Geoapify Response", "🗺️ Map"]
 
 st.set_page_config(page_title="Shipment Route Prioritizer", page_icon="📦", layout="wide")
 
@@ -79,6 +79,28 @@ def _stop_priority_window(stop, shipment):
     return shipment["delivery"].get("time_window")
 
 
+def build_leg_rows(routes, travel):
+    """One row per consecutive pair of stops in the final route, with the
+    real Geoapify-computed distance/time for that leg - these are exactly
+    the numbers that sum to total_miles/total_duration.
+    """
+    stops = list(routes.values())
+    rows = []
+    for previous_stop, stop in zip(stops, stops[1:]):
+        from_key = (previous_stop["type"], previous_stop["shipment_id"])
+        to_key = (stop["type"], stop["shipment_id"])
+        leg = travel.get((from_key, to_key))
+        rows.append(
+            {
+                "From": f"{previous_stop['type']} {previous_stop['shipment_id']}",
+                "To": f"{stop['type']} {stop['shipment_id']}",
+                "Distance (m)": leg["distance"] if leg else None,
+                "Time (s)": leg["time"] if leg else None,
+            }
+        )
+    return rows
+
+
 def build_priority_reasons(ordered_stops, travel):
     """One reason string per stop (keyed by stop_key, since a shipment can
     contribute both a pickup and a delivery stop), explaining why it landed
@@ -115,17 +137,23 @@ with st.sidebar:
     st.caption(
         "Shipment data comes from `sample_data.py`. Edit that file to try different data."
     )
+    pickup_count = sum(1 for shipment in SAMPLE_SHIPMENTS if shipment.get("pickup"))
     st.metric("Shipments on record", len(SAMPLE_SHIPMENTS))
+    st.caption(
+        f"{pickup_count} of these have their own pickup point, so the route below will have "
+        f"{len(SAMPLE_SHIPMENTS) + pickup_count} stops in total (one extra per pickup)."
+    )
     generate_clicked = st.button("🚀 Generate Prioritized Route", type="primary", use_container_width=True)
 
     if generate_clicked:
-        with st.spinner("Getting the Geoapify travel matrix..."):
+        with st.spinner("Calling the Geoapify Routing Matrix API..."):
             try:
-                travel, skipped_keys = get_travel_matrix(SAMPLE_SHIPMENTS)
+                travel, skipped_keys, raw_response = get_travel_matrix(SAMPLE_SHIPMENTS)
             except GeoapifyError as exc:
                 st.session_state["error"] = f"Geoapify request failed: {exc}"
                 st.session_state.pop("result", None)
                 st.session_state.pop("travel", None)
+                st.session_state.pop("raw_response", None)
             else:
                 result = generate_prioritized_route(SAMPLE_SHIPMENTS, travel, skipped_keys)
                 if "error" in result:
@@ -134,6 +162,7 @@ with st.sidebar:
                 else:
                     st.session_state["result"] = result
                     st.session_state["travel"] = travel
+                    st.session_state["raw_response"] = raw_response
                     st.session_state.pop("error", None)
         # Jump straight to the results page - must be set before the radio
         # widget below is created, since that's what controls its value.
@@ -151,6 +180,7 @@ with st.sidebar:
 
 result = st.session_state.get("result")
 travel = st.session_state.get("travel")
+raw_response = st.session_state.get("raw_response")
 error = st.session_state.get("error")
 
 # ---------------------------------------------------------------------------
@@ -158,7 +188,13 @@ error = st.session_state.get("error")
 # ---------------------------------------------------------------------------
 
 if page == "🏭 Shipments":
-    st.caption("This is the input data for the run - fixed for this demo, not editable live.")
+    pickup_count = sum(1 for shipment in SAMPLE_SHIPMENTS if shipment.get("pickup"))
+    st.caption(
+        "This is the input data for the run - fixed for this demo, not editable live. "
+        f"{len(SAMPLE_SHIPMENTS)} shipments, {pickup_count} with a separate pickup point - "
+        f"the Prioritized Route page will show {len(SAMPLE_SHIPMENTS) + pickup_count} stops "
+        "in total, since each of those contributes both a pickup stop and a delivery stop."
+    )
     record_df = pd.DataFrame(
         [
             {
@@ -183,9 +219,14 @@ elif page == "📋 Prioritized Route":
     elif not result:
         st.info("Click **Generate Prioritized Route** in the sidebar to see results here.")
     else:
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         col1.metric("Total distance", f"{result['total_miles']} mi")
         col2.metric("Estimated travel time", result["total_duration"])
+        col3.metric("Stops", f"{len(result['routes'])}", help="More than the shipment count when shipments have their own pickup stop.")
+        st.caption(
+            f"{len(result['routes'])} stops for {len(SAMPLE_SHIPMENTS)} shipments - shipments with "
+            "their own pickup point contribute two stops (pickup + delivery) instead of one."
+        )
 
         shipments_by_id = {shipment["shipment_id"]: shipment for shipment in SAMPLE_SHIPMENTS}
         ordered_stops = [
@@ -208,33 +249,20 @@ elif page == "📋 Prioritized Route":
             )
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-elif page == "🔍 Travel Matrix":
-    if not travel:
-        st.info("Click **Generate Prioritized Route** in the sidebar to see travel data here.")
+elif page == "🔍 Geoapify Response":
+    if not result or not travel:
+        st.info("Click **Generate Prioritized Route** in the sidebar to see the Geoapify response here.")
     else:
         st.caption(
-            "Real drive distance/time between each shipment's own pickup and delivery point - "
-            "the only thing Geoapify is asked to compute; the visiting order itself is decided "
-            "by this project's own logic, not Geoapify's optimizer."
+            "Real drive distance/time for each leg of the final route, straight from Geoapify's "
+            "Routing Matrix API - the only thing Geoapify is asked to compute. These numbers sum "
+            "to the total distance/time shown on the Prioritized Route page."
         )
-        rows = []
-        for shipment in SAMPLE_SHIPMENTS:
-            pickup = shipment.get("pickup")
-            if not pickup:
-                continue
-            leg = travel.get((("pickup", shipment["shipment_id"]), ("delivery", shipment["shipment_id"])))
-            rows.append(
-                {
-                    "Shipment ID": shipment["shipment_id"],
-                    "Pickup origin": pickup.get("origin", "—"),
-                    "Pickup -> Delivery distance (m)": leg["distance"] if leg else None,
-                    "Pickup -> Delivery time (s)": leg["time"] if leg else None,
-                }
-            )
-        if rows:
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        else:
-            st.info("No shipments in this run have a separate pickup point.")
+        leg_rows = build_leg_rows(result["routes"], travel)
+        st.dataframe(pd.DataFrame(leg_rows), use_container_width=True, hide_index=True)
+
+        with st.expander("Raw Geoapify Routing Matrix API response (JSON)"):
+            st.json(raw_response)
 
 elif page == "🗺️ Map":
     if not result:

@@ -99,10 +99,15 @@ between instantly:
   shipment data and the real Geoapify travel matrix for that run - see
   `_describe_event()` / `build_priority_reasons()` in `app.py`. It exists
   only for this UI; the core `generate_prioritized_route()` output has no
-  reason field, matching the assignment's exact output format.
-- **🔍 Travel Matrix** - the real drive distance/time between each
-  shipment's own pickup and delivery point - the only thing Geoapify is
-  asked to compute.
+  reason field, matching the assignment's exact output format. A shipment
+  with its own pickup contributes two stops (pickup + delivery), so the
+  stop count here is naturally higher than the shipment count - both pages
+  call this out explicitly to avoid confusion.
+- **🔍 Geoapify Response** - a table of every leg in the final route (the
+  real distance/time Geoapify returned for each consecutive stop-to-stop
+  hop - these are exactly the numbers that sum to the totals on the
+  Prioritized Route page), plus the actual, unmodified JSON Geoapify's
+  Routing Matrix API returned, in an expander.
 - **🗺️ Map** - every stop plotted in visiting order (🟣 pickup, 🔵
   delivery), connected by straight lines (not turn-by-turn road geometry -
   see "Notes / assumptions").

@@ -62,10 +62,13 @@ def _collect_points(shipments: list) -> list:
     return points
 
 
-def _call_matrix_api(locations: list) -> list:
+def _call_matrix_api(locations: list) -> tuple:
     """Call Geoapify's Routing Matrix API with every location as both a
-    source and a target, returning a locations x locations matrix of
-    {"distance": meters, "time": seconds} cells.
+    source and a target. Returns (matrix, raw_response):
+      - matrix: a locations x locations grid of {"distance": meters, "time": seconds} cells.
+      - raw_response: the exact JSON Geoapify returned, unmodified - kept
+        around purely so the UI can show the real API response, not just
+        our own derived numbers.
     """
     payload = {
         "mode": "drive",
@@ -79,18 +82,19 @@ def _call_matrix_api(locations: list) -> list:
         timeout=config.REQUEST_TIMEOUT,
     )
     response.raise_for_status()
-    sources_to_targets = response.json().get("sources_to_targets", [])
-    return [
+    raw_response = response.json()
+    matrix = [
         [{"distance": cell["distance"], "time": cell["time"]} for cell in row]
-        for row in sources_to_targets
+        for row in raw_response.get("sources_to_targets", [])
     ]
+    return matrix, raw_response
 
 
 def get_travel_matrix(shipments: list) -> tuple:
     """Geocode every pickup/delivery point (once per distinct address) and
     return real drive distance/time between every pair of them.
 
-    Returns (travel, skipped_keys):
+    Returns (travel, skipped_keys, raw_response):
       - travel: {(from_key, to_key): {"distance": meters, "time": seconds}}
         for every pair of successfully-geocoded points.
       - skipped_keys: the set of point keys whose address couldn't be
@@ -98,6 +102,7 @@ def get_travel_matrix(shipments: list) -> tuple:
         the old _build_jobs behaviour of skipping bad addresses here so one
         unresolvable stop doesn't fail the whole request; route_service.py
         treats any *valid* shipment that lands in here as an unusable route.
+      - raw_response: the unmodified JSON Geoapify's Matrix API returned.
 
     Raises GeoapifyError only if nothing at all could be geocoded, or the
     Matrix API call itself fails.
@@ -130,7 +135,7 @@ def get_travel_matrix(shipments: list) -> tuple:
     locations = [location for _, location in geocoded]
 
     try:
-        matrix = _call_matrix_api(locations)
+        matrix, raw_response = _call_matrix_api(locations)
     except requests.RequestException as exc:
         raise GeoapifyError(f"Geoapify matrix request failed: {exc}") from exc
 
@@ -141,4 +146,4 @@ def get_travel_matrix(shipments: list) -> tuple:
                 continue
             travel[(from_key, to_key)] = matrix[i][j]
 
-    return travel, skipped_keys
+    return travel, skipped_keys, raw_response
