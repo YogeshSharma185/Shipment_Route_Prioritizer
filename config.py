@@ -15,4 +15,4 @@ GEOAPIFY_BASE_URL = "https://api.geoapify.com"
 REQUEST_TIMEOUT = 15
 
 GEOCODE_URL = f"{GEOAPIFY_BASE_URL}/v1/geocode/search"
-ROUTE_PLANNER_URL = f"{GEOAPIFY_BASE_URL}/v1/routeplanner"
+MATRIX_URL = f"{GEOAPIFY_BASE_URL}/v1/routematrix"

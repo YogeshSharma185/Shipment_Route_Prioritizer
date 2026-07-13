@@ -1,7 +1,13 @@
-"""Everything related to talking to Geoapify: geocoding addresses and calling
-the Route Planner API. This module has one job: get a route plan back from
-Geoapify. It does not validate shipment data or decide delivery order -
-that happens in route_service.py.
+"""Everything related to talking to Geoapify: geocoding addresses and getting
+real drive distances/times between them. This module has one job: turn
+addresses into facts (coordinates, pairwise travel time/distance). It does
+not decide what order to visit stops in or validate shipment data - that's
+route_service.py's job.
+
+Each shipment carries its own pickup point (a specific warehouse origin) and
+delivery point, so "what order to visit stops in" is a sequencing problem
+route_service.py solves itself. The only thing asked of Geoapify here is a
+travel-time matrix between every point that could appear in a route.
 """
 import requests
 
@@ -9,7 +15,7 @@ import config
 
 
 class GeoapifyError(Exception):
-    """Raised whenever we can't get a usable route plan back from Geoapify."""
+    """Raised whenever we can't get usable travel data back from Geoapify."""
 
 
 def geocode_address(address: str) -> list:
@@ -33,53 +39,106 @@ def geocode_address(address: str) -> list:
     return [top_match["lon"], top_match["lat"]]
 
 
-def _build_jobs(shipments: list) -> list:
-    """Geocode each shipment's address into a Route Planner "job". Shipments with
-    a missing address or an address Geoapify can't find are skipped here -
-    they're reported properly later by route_service's field validation.
+def _collect_points(shipments: list) -> list:
+    """List every (key, address) pair that needs a location: one per shipment
+    pickup (if it has one - each shipment's own pickup.address is that
+    shipment's specific warehouse origin) and one per shipment delivery. key
+    is a (kind, id) tuple used to look distances back up later -
+    ("pickup", shipment_id) / ("delivery", shipment_id).
     """
-    jobs = []
-    for index, shipment in enumerate(shipments):
+    points = []
+    for shipment in shipments:
         if not isinstance(shipment, dict):
             continue
-        address = shipment.get("address")
-        if not address:
+        shipment_id = shipment.get("shipment_id")
+        if not shipment_id:
             continue
-        try:
-            location = geocode_address(address)
-        except GeoapifyError:
-            continue
-        jobs.append({"id": shipment.get("shipment_id") or f"job_{index}", "location": location})
-    return jobs
+        pickup = shipment.get("pickup")
+        if isinstance(pickup, dict) and pickup.get("address"):
+            points.append((("pickup", shipment_id), pickup["address"]))
+        delivery = shipment.get("delivery") or {}
+        points.append((("delivery", shipment_id), delivery.get("address")))
+
+    return points
 
 
-def get_geoapify_route(origin: str, shipments: list) -> dict:
-    """Prepare the Route Planner payload, call the Geoapify API, and return the
-    raw JSON response. Raises GeoapifyError on any failure (network issue,
-    bad API key, no geocodable stops, etc.) so callers can handle it gracefully.
+def _call_matrix_api(locations: list) -> list:
+    """Call Geoapify's Routing Matrix API with every location as both a
+    source and a target, returning a locations x locations matrix of
+    {"distance": meters, "time": seconds} cells.
     """
+    payload = {
+        "mode": "drive",
+        "sources": [{"location": location} for location in locations],
+        "targets": [{"location": location} for location in locations],
+    }
+    response = requests.post(
+        config.MATRIX_URL,
+        params={"apiKey": config.GEOAPIFY_API_KEY},
+        json=payload,
+        timeout=config.REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    sources_to_targets = response.json().get("sources_to_targets", [])
+    return [
+        [{"distance": cell["distance"], "time": cell["time"]} for cell in row]
+        for row in sources_to_targets
+    ]
+
+
+def get_travel_matrix(shipments: list) -> tuple:
+    """Geocode every pickup/delivery point (once per distinct address) and
+    return real drive distance/time between every pair of them.
+
+    Returns (travel, skipped_keys):
+      - travel: {(from_key, to_key): {"distance": meters, "time": seconds}}
+        for every pair of successfully-geocoded points.
+      - skipped_keys: the set of point keys whose address couldn't be
+        geocoded (missing address, or Geoapify couldn't resolve it) - mirrors
+        the old _build_jobs behaviour of skipping bad addresses here so one
+        unresolvable stop doesn't fail the whole request; route_service.py
+        treats any *valid* shipment that lands in here as an unusable route.
+
+    Raises GeoapifyError only if nothing at all could be geocoded, or the
+    Matrix API call itself fails.
+    """
+    points = _collect_points(shipments)
+
+    address_cache = {}
+    geocoded = []
+    skipped_keys = set()
+
+    for key, address in points:
+        if not address:
+            skipped_keys.add(key)
+            continue
+        if address not in address_cache:
+            try:
+                address_cache[address] = geocode_address(address)
+            except GeoapifyError:
+                address_cache[address] = None
+        location = address_cache[address]
+        if location is None:
+            skipped_keys.add(key)
+            continue
+        geocoded.append((key, location))
+
+    if not geocoded:
+        raise GeoapifyError("No shipment addresses could be geocoded")
+
+    keys = [key for key, _ in geocoded]
+    locations = [location for _, location in geocoded]
+
     try:
-        origin_location = geocode_address(origin)
-        jobs = _build_jobs(shipments)
-        if not jobs:
-            raise GeoapifyError("No shipment addresses could be geocoded")
-
-        payload = {
-            "mode": "drive",
-            "agents": [{"start_location": origin_location}],
-            "jobs": jobs,
-        }
-
-        response = requests.post(
-            config.ROUTE_PLANNER_URL,
-            params={"apiKey": config.GEOAPIFY_API_KEY},
-            json=payload,
-            timeout=config.REQUEST_TIMEOUT,
-        )
-        response.raise_for_status()
-        return response.json()
-
-    except GeoapifyError:
-        raise
+        matrix = _call_matrix_api(locations)
     except requests.RequestException as exc:
-        raise GeoapifyError(f"Geoapify request failed: {exc}") from exc
+        raise GeoapifyError(f"Geoapify matrix request failed: {exc}") from exc
+
+    travel = {}
+    for i, from_key in enumerate(keys):
+        for j, to_key in enumerate(keys):
+            if i == j:
+                continue
+            travel[(from_key, to_key)] = matrix[i][j]
+
+    return travel, skipped_keys

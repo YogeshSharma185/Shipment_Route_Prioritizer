@@ -1,35 +1,53 @@
-"""Turns shipment data + a Geoapify Route Planner response into a prioritized,
+"""Turns shipment data + a Geoapify travel-time matrix into a prioritized,
 customer-friendly route. Responsibilities:
-  1. Validate the Geoapify response itself.
-  2. Validate shipment data (ids, addresses, time windows).
-  3. Prioritize shipments using the business rules below.
-  4. Build the final "routes" output.
+  1. Validate the shipment data (ids, addresses, time windows).
+  2. Prioritize every pickup/delivery stop using the business rules below.
+  3. Build the final "routes" output.
 
-Priority rules (most to least urgent):
+Shipment shape:
+  {
+    "shipment_id": "SH001",
+    "pickup": {                                        # optional
+        "origin": "Warehouse A",                        # label only, for display
+        "address": "Warehouse A",
+        "time_window": {"start": "09:00", "end": "10:00"},  # optional
+    },
+    "delivery": {
+        "address": "123 Main Street",
+        "time_window": {"start": "11:00", "end": "13:00"},  # optional
+    },
+  }
 
-  Group 0 - TIME_CRITICAL: any shipment with a deadline (an "end"), whether
-  or not it also has a "start" (i.e. both strict windows and deadline-only
-  shipments land in this one group). They're merged onto a single timeline
-  rather than treating "has a full window" as always more urgent than "has a
-  deadline" - a deadline of 12:30 is more urgent than a window that doesn't
-  even start until 14:00, so a rigid window-before-deadline split produces
-  the wrong order. Sorted by:
-    a. anchor time - the start time if present (a window's earliest useful
-       arrival), otherwise the end time (a deadline's only reference point).
-    b. window duration, as a tiebreak when two shipments share the same
-       anchor (e.g. same start time but different end times - the tighter
-       window is more urgent). Deadline-only shipments have no duration, so
-       they always lose this tiebreak to an actual windowed shipment sharing
-       their anchor time.
-    c. Geoapify route distance (closer first) - the assignment's
-       "same time window" tiebreak rule.
+Each shipment may belong to a different pickup origin (warehouse) - there is
+no single shared starting point. A shipment with no "pickup" at all is
+delivery-only, exactly like the original single-location design. Both
+time_window fields are independently optional, so a shipment may have
+neither, either, or both.
 
-  Group 1 - START_ONLY: has a start but no end ("don't deliver before X").
-  No deadline pressure at all, so always after every TIME_CRITICAL shipment
-  regardless of how early its start is. Sorted by start time, then distance.
+Business rules - a shipment with a pickup contributes two independent
+*events* to the ordering (a pickup and a delivery), each classified by its
+own time window exactly like the original single-window design:
 
-  Group 2 - NO_WINDOW: no time_window at all. Always last, sorted by
-  distance only.
+  Group 0 - TIME_CRITICAL: any event with a deadline (an "end"), whether or
+  not it also has a "start" (strict windows and deadline-only events share
+  one timeline, rather than treating "has a full window" as always more
+  urgent than "has a deadline" regardless of timing).
+  Group 1 - START_ONLY: has a start but no end.
+  Group 2 - NO_WINDOW: no time window at all.
+
+Within a tied group, the standard rule is real travel distance - but with
+several different pickup origins in play there's no longer one shared
+warehouse to measure "closer" from. So the tiebreak here is "closer to
+wherever the driver currently is" - i.e. distance from whichever stop was
+placed immediately before it in the route being built (see
+_prioritize_events). This is a direct generalisation of the original
+single-origin "closer stop wins the tie" rule to a multi-origin setting.
+
+On top of priority, a pickup event must always come before its own
+shipment's delivery event. _prioritize_events enforces this directly (by
+only ever considering a delivery "ready" once its own pickup has already
+been placed) rather than sorting first and patching precedence afterwards -
+simpler to read, and impossible to get out of order by construction.
 """
 from utils.time_utils import (
     meters_to_miles,
@@ -41,43 +59,43 @@ from utils.time_utils import (
 TIME_CRITICAL, START_ONLY, NO_WINDOW = range(3)
 NO_DURATION = 24 * 3600 + 1  # bigger than any possible same-day window
 
+PICKUP, DELIVERY = "pickup", "delivery"
 
-def generate_prioritized_route(shipments, geoapify_response, origin_address):
-    """Validate everything, prioritize shipments, and return the final route.
 
-    origin_address is the warehouse address supplied by the caller for this
-    run - there is no configured default, since the warehouse can change per
-    request.
+def generate_prioritized_route(shipments, travel, skipped_keys):
+    """Validate the shipments, prioritize every stop, and return the final
+    route.
+
+    travel/skipped_keys are exactly what geoapify_service.get_travel_matrix()
+    returns for these same shipments.
 
     On any validation failure, returns {"error": ..., "details": [...]}.
-    On a bad/unusable Geoapify response, or any unexpected failure, returns
+    On missing travel data, or any unexpected failure, returns
     {"error": "Unable to generate route"} instead of raising.
     """
     try:
-        if not _is_valid_geoapify_response(geoapify_response):
-            return {"error": "Unable to generate route"}
-
         valid_shipments, errors = _validate_shipments(shipments)
         if errors:
             return {"error": "Invalid shipment data", "details": errors}
 
-        job_distances = _extract_job_distances(geoapify_response)
-        if any(shipment["shipment_id"] not in job_distances for shipment in valid_shipments):
-            # Geoapify's live optimizer occasionally drops a job from its solution
-            # without reporting it in properties.issues. Treat that as incomplete
-            # data rather than silently defaulting the missing job's tie-break
-            # distance to 0, which would make it look (wrongly) like the closest stop.
+        if _has_missing_travel_data(valid_shipments, skipped_keys):
+            # Mirrors the original project's stance: one unresolvable address
+            # shouldn't fail validation, but a *valid* shipment with no usable
+            # travel data can't be routed, so it's an "Unable to generate
+            # route" case rather than silently dropping or mis-prioritizing it.
             return {"error": "Unable to generate route"}
 
-        total_distance_m, total_time_s = _extract_totals(geoapify_response)
+        shipments_by_id = {shipment["shipment_id"]: shipment for shipment in valid_shipments}
+        events = _expand_events(valid_shipments)
+        sequence = _prioritize_events(events, travel)
 
-        sorted_shipments = _prioritize_shipments(valid_shipments, job_distances)
-        routes = _build_routes_output(sorted_shipments, origin_address)
+        total_distance, total_time = _compute_totals(sequence, travel)
+        routes = _build_routes_output(sequence, shipments_by_id)
 
         return {
             "routes": routes,
-            "total_miles": meters_to_miles(total_distance_m),
-            "total_duration": seconds_to_duration_str(total_time_s),
+            "total_miles": meters_to_miles(total_distance),
+            "total_duration": seconds_to_duration_str(total_time),
         }
     except Exception:
         return {"error": "Unable to generate route"}
@@ -112,13 +130,34 @@ def _validate_shipments(shipments):
         if not shipment_id:
             errors.append({"shipment_id": label, "issue": "Missing shipment_id"})
             continue
-        if not shipment.get("address"):
-            errors.append({"shipment_id": label, "issue": "Missing address"})
+
+        delivery = shipment.get("delivery")
+        if not isinstance(delivery, dict) or not delivery.get("address"):
+            errors.append({"shipment_id": label, "issue": "Missing delivery address"})
             continue
 
-        time_window = shipment.get("time_window")
-        if time_window is not None:
-            issue = _validate_time_window(time_window)
+        delivery_window = delivery.get("time_window")
+        if delivery_window is not None:
+            issue = _validate_time_window(delivery_window)
+            if issue:
+                errors.append({"shipment_id": label, "issue": f"Delivery window: {issue}"})
+                continue
+
+        pickup = shipment.get("pickup")
+        pickup_window = None
+        if pickup is not None:
+            if not isinstance(pickup, dict) or not pickup.get("address"):
+                errors.append({"shipment_id": label, "issue": "Missing pickup address"})
+                continue
+            pickup_window = pickup.get("time_window")
+            if pickup_window is not None:
+                issue = _validate_time_window(pickup_window)
+                if issue:
+                    errors.append({"shipment_id": label, "issue": f"Pickup window: {issue}"})
+                    continue
+
+        if pickup_window and delivery_window:
+            issue = _validate_pickup_before_delivery(pickup_window, delivery_window)
             if issue:
                 errors.append({"shipment_id": label, "issue": issue})
                 continue
@@ -146,25 +185,80 @@ def _validate_time_window(time_window):
     return None
 
 
-def _is_valid_geoapify_response(geoapify_response):
-    """A usable response has at least one route feature and no unassigned jobs."""
-    if not isinstance(geoapify_response, dict):
-        return False
-    if not geoapify_response.get("features"):
-        return False
-    issues = geoapify_response.get("properties", {}).get("issues", {})
-    if issues.get("unassigned_jobs"):
-        return False
-    return True
+def _validate_pickup_before_delivery(pickup_window, delivery_window):
+    """Structural sanity check only: a pickup deadline can't be at or after
+    the delivery deadline, since that leaves no time at all for delivery to
+    happen afterwards.
+    """
+    pickup_end, delivery_end = pickup_window.get("end"), delivery_window.get("end")
+    if pickup_end and delivery_end and parse_time(pickup_end) >= parse_time(delivery_end):
+        return "Pickup deadline is not before delivery deadline"
+    return None
+
+
+def _has_missing_travel_data(shipments, skipped_keys):
+    for shipment in shipments:
+        shipment_id = shipment["shipment_id"]
+        if ("delivery", shipment_id) in skipped_keys:
+            return True
+        if shipment.get("pickup") and ("pickup", shipment_id) in skipped_keys:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
-# Prioritization
+# Event expansion + classification
 # ---------------------------------------------------------------------------
 
-def _classify(shipment):
-    """Return (group, anchor_seconds, window_duration_seconds) - see module docstring."""
-    time_window = shipment.get("time_window") or {}
+def _expand_events(shipments):
+    """Turn each shipment into one event (delivery only) or two events
+    (pickup + delivery, linked by shipment_id).
+
+    Each event carries both its own "time_window" (the real constraint, used
+    for validation/display) and a "priority_window" used for classification.
+    They're usually the same - except a pickup with no window of its own
+    still has to happen early enough for its own delivery's deadline to be
+    reachable, so it borrows the delivery's window for priority purposes.
+    Without this, an unconstrained pickup would always sort into the lowest
+    priority group and could get scheduled after its own delivery's deadline
+    has effectively already passed.
+    """
+    events = []
+    for shipment in shipments:
+        shipment_id = shipment["shipment_id"]
+        pickup = shipment.get("pickup")
+        delivery = shipment["delivery"]
+        if pickup:
+            pickup_window = pickup.get("time_window")
+            events.append(
+                {
+                    "shipment_id": shipment_id,
+                    "kind": PICKUP,
+                    "key": ("pickup", shipment_id),
+                    "address": pickup["address"],
+                    "time_window": pickup_window,
+                    "priority_window": pickup_window or delivery.get("time_window"),
+                }
+            )
+        delivery_window = delivery.get("time_window")
+        events.append(
+            {
+                "shipment_id": shipment_id,
+                "kind": DELIVERY,
+                "key": ("delivery", shipment_id),
+                "address": delivery["address"],
+                "time_window": delivery_window,
+                "priority_window": delivery_window,
+            }
+        )
+    return events
+
+
+def _classify_window(time_window):
+    """Return (group, anchor_seconds, window_duration_seconds) for a single
+    time window - see module docstring for the group rules.
+    """
+    time_window = time_window or {}
     start, end = time_window.get("start"), time_window.get("end")
 
     if end:
@@ -178,67 +272,86 @@ def _classify(shipment):
     return NO_WINDOW, 0, 0
 
 
-def _prioritize_shipments(shipments, job_distances):
-    def sort_key(shipment):
-        group, anchor, duration = _classify(shipment)
-        distance = job_distances.get(shipment["shipment_id"], 0)
-        return (group, anchor, duration, distance, shipment["shipment_id"])
-
-    return sorted(shipments, key=sort_key)
-
-
 # ---------------------------------------------------------------------------
-# Geoapify response parsing
+# Prioritization
 # ---------------------------------------------------------------------------
 
-def _extract_job_distances(geoapify_response):
-    """Map each job's id to its cumulative route distance (meters) from the
-    warehouse, based on the order Geoapify chose. Used only as a tie-breaker
-    when two shipments share the same time-window priority. Returns an empty
-    dict (falling back to no tie-break) if the response shape is unexpected.
+def _prioritize_events(events, travel):
+    """Greedily build the visiting order one stop at a time:
+      1. Only consider events that are "ready" - a delivery is only ready
+         once its own shipment's pickup has already been placed; everything
+         else is always ready.
+      2. Among ready events, take the most urgent priority group/anchor/
+         duration (see _classify_window).
+      3. Break ties on real travel distance from whichever stop was placed
+         right before it (the closer one wins) - falling back to
+         shipment_id for the very first stop, when there's no "current
+         position" yet to measure from.
     """
-    distances = {}
-    try:
-        properties = geoapify_response["features"][0]["properties"]
-        legs = properties.get("legs", [])
-        actions = properties.get("actions", [])
+    has_pickup = {event["shipment_id"] for event in events if event["kind"] == PICKUP}
+    placed_pickups = set()
+    remaining = list(events)
+    sequence = []
+    current_key = None
 
-        cumulative_by_waypoint = {0: 0}
-        for leg in legs:
-            from_idx, to_idx = leg["from_waypoint_index"], leg["to_waypoint_index"]
-            cumulative_by_waypoint[to_idx] = cumulative_by_waypoint.get(from_idx, 0) + leg["distance"]
+    while remaining:
+        ready = [
+            event
+            for event in remaining
+            if event["kind"] == PICKUP
+            or event["shipment_id"] not in has_pickup
+            or event["shipment_id"] in placed_pickups
+        ]
 
-        for action in actions:
-            if action.get("type") == "job" and "job_id" in action:
-                distances[action["job_id"]] = cumulative_by_waypoint.get(action["waypoint_index"], 0)
-    except (KeyError, IndexError, TypeError):
-        pass
-    return distances
+        best_priority = min(_classify_window(event["priority_window"]) for event in ready)
+        tied = [event for event in ready if _classify_window(event["priority_window"]) == best_priority]
+
+        if current_key is None or len(tied) == 1:
+            next_event = sorted(tied, key=lambda event: event["shipment_id"])[0]
+        else:
+            next_event = min(tied, key=lambda event: _leg_distance(current_key, event["key"], travel))
+
+        sequence.append(next_event)
+        remaining.remove(next_event)
+        if next_event["kind"] == PICKUP:
+            placed_pickups.add(next_event["shipment_id"])
+        current_key = next_event["key"]
+
+    return sequence
 
 
-def _extract_totals(geoapify_response):
-    """Pull the overall route distance (meters) and time (seconds)."""
-    try:
-        properties = geoapify_response["features"][0]["properties"]
-        return properties.get("distance", 0), properties.get("time", 0)
-    except (KeyError, IndexError, TypeError):
-        return 0, 0
+def _leg_distance(from_key, to_key, travel):
+    leg = travel.get((from_key, to_key))
+    return leg["distance"] if leg else 0
+
+
+def _compute_totals(sequence, travel):
+    """Sum real travel distance/time along the exact sequence produced above."""
+    total_distance, total_time = 0, 0
+    prev_key = None
+    for event in sequence:
+        if prev_key is not None:
+            leg = travel.get((prev_key, event["key"]))
+            if leg:
+                total_distance += leg["distance"]
+                total_time += leg["time"]
+        prev_key = event["key"]
+    return total_distance, total_time
 
 
 # ---------------------------------------------------------------------------
 # Output building
 # ---------------------------------------------------------------------------
 
-def _build_routes_output(sorted_shipments, origin_address):
-    routes = {"000": {"address": origin_address, "shipment_id": "", "type": "origin"}}
-
-    step = 0
-    for step, shipment in enumerate(sorted_shipments, start=1):
-        routes[f"{step:03d}"] = {
-            "address": shipment["address"],
-            "shipment_id": shipment["shipment_id"],
-            "type": "drop",
+def _build_routes_output(sequence, shipments_by_id):
+    routes = {}
+    for step, event in enumerate(sequence, start=1):
+        entry = {
+            "address": event["address"],
+            "shipment_id": event["shipment_id"],
+            "type": event["kind"],
         }
-
-    routes[f"{step + 1:03d}"] = {"address": origin_address, "shipment_id": "", "type": "end"}
+        if event["kind"] == PICKUP:
+            entry["origin"] = shipments_by_id[event["shipment_id"]]["pickup"].get("origin")
+        routes[f"{step:03d}"] = entry
     return routes
