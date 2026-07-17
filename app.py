@@ -20,7 +20,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 
 from sample_data import AVAILABLE_ORIGINS, SAMPLE_SHIPMENTS
-from services.geoapify_service import GeoapifyError, geocode_address, get_travel_matrix
+from services.geoapify_service import GeoapifyError, get_travel_matrix
 from services.route_service import _classify_window, generate_prioritized_route
 
 # folium's default marker icons use Font Awesome 4 names, not "warehouse"/"box" (FA5+).
@@ -75,6 +75,38 @@ def _stop_address(stop):
     whichever field happens to be non-null.
     """
     return stop["pickup_address"] if stop["type"] == "pickup" else stop["delivery_address"]
+
+
+# Small ring of offsets (~15-20m) used only to visually separate markers that
+# land on the exact same coordinates - real addresses in sample_data.py are
+# deliberately reused across shipments, so several stops can share one exact
+# location. Purely a map-display nudge: it never touches routing, distance,
+# or any other logic, and it only ever triggers on coordinates that actually
+# come back duplicated from Geoapify for the current run - nothing here is
+# tied to specific addresses, so it adapts automatically to whatever
+# shipments/origins are in sample_data.py.
+_JITTER_RING = [
+    (0, 0), (0.00015, 0), (-0.00015, 0), (0, 0.00015), (0, -0.00015),
+    (0.00011, 0.00011), (-0.00011, -0.00011), (0.00011, -0.00011), (-0.00011, 0.00011),
+]
+
+
+def _spread_duplicate_locations(entries):
+    """Nudge markers apart when two or more land on the exact same
+    coordinates, so every stop stays individually visible and clickable
+    instead of silently stacking underneath whichever one was drawn last.
+    `entries` is a list of dicts each with "lat"/"lon" (plus whatever other
+    keys the caller needs); returns a new list with "lat"/"lon" adjusted.
+    """
+    seen_counts = {}
+    spread = []
+    for entry in entries:
+        location_key = (round(entry["lat"], 5), round(entry["lon"], 5))
+        count = seen_counts.get(location_key, 0)
+        seen_counts[location_key] = count + 1
+        dlat, dlon = _JITTER_RING[count % len(_JITTER_RING)]
+        spread.append({**entry, "lat": entry["lat"] + dlat, "lon": entry["lon"] + dlon})
+    return spread
 
 
 def _describe_event(shipment, kind):
@@ -210,12 +242,13 @@ with st.sidebar:
     if generate_clicked:
         with st.spinner("Calling the Geoapify Routing Matrix API..."):
             try:
-                travel, skipped_keys, raw_response = get_travel_matrix(SAMPLE_SHIPMENTS, AVAILABLE_ORIGINS)
+                travel, skipped_keys, raw_response, locations = get_travel_matrix(SAMPLE_SHIPMENTS, AVAILABLE_ORIGINS)
             except GeoapifyError as exc:
                 st.session_state["error"] = f"Geoapify request failed: {exc}"
                 st.session_state.pop("result", None)
                 st.session_state.pop("travel", None)
                 st.session_state.pop("raw_response", None)
+                st.session_state.pop("locations", None)
             else:
                 result = generate_prioritized_route(SAMPLE_SHIPMENTS, travel, skipped_keys, AVAILABLE_ORIGINS)
                 if "error" in result:
@@ -225,6 +258,7 @@ with st.sidebar:
                     st.session_state["result"] = result
                     st.session_state["travel"] = travel
                     st.session_state["raw_response"] = raw_response
+                    st.session_state["locations"] = locations
                     st.session_state.pop("error", None)
         # Jump straight to the results page - must be set before the radio
         # widget below is created, since that's what controls its value.
@@ -243,6 +277,7 @@ with st.sidebar:
 result = st.session_state.get("result")
 travel = st.session_state.get("travel")
 raw_response = st.session_state.get("raw_response")
+locations = st.session_state.get("locations")
 error = st.session_state.get("error")
 
 # ---------------------------------------------------------------------------
@@ -381,10 +416,13 @@ elif page == "🗺️ Map":
         st.info("Click **Generate Prioritized Route** in the sidebar to see the map here.")
     else:
         st.caption(
-            "🟢 Origin  🟣 Pickup  🔵 Delivery, numbered in visiting order. Lines are straight "
-            "connections between stops, not turn-by-turn road geometry - this project no longer "
-            "calls Geoapify's Route Planner (which returned real road geometry) now that stop "
-            "order and origin selection are decided by its own logic."
+            "🟢 Origin  🟣 Pickup  🔵 Delivery, numbered in visiting order - exactly matching "
+            "the Prioritized Route page's stop order and types. Lines are straight connections "
+            "between stops, not turn-by-turn road geometry - this project no longer calls "
+            "Geoapify's Route Planner (which returned real road geometry) now that stop order "
+            "and origin selection are decided by its own logic. A few markers may sit a short "
+            "distance from each other even though the real addresses coincide exactly - see the "
+            "caption below the map."
         )
         origin_names = [candidate["origin"] for candidate in result["candidates"]]
         default_index = origin_names.index(_selected_candidate(result)["origin"])
@@ -396,38 +434,54 @@ elif page == "🗺️ Map":
         )
         chosen_origin = ORIGINS_BY_NAME[chosen_origin_name]
 
-        try:
+        if not locations:
+            st.warning("No cached coordinates for this run - regenerate the route to view the map.")
+        else:
+            # Build the exact list of stops to plot straight from this run's
+            # own data (origin + every stop in chosen_candidate["routes"], in
+            # order) - nothing here is hardcoded to specific addresses or
+            # counts, so a different sample_data.py or a different selected
+            # origin naturally plots whatever it actually produces.
+            stops_to_plot = [
+                (("origin", chosen_origin_name), f"Start - origin - {chosen_origin_name}", chosen_origin["address"], "origin")
+            ]
+            stops_to_plot += [
+                (_stop_key(stop), f"Stop {stop_key} - {stop['type']} - {stop['shipment_id']}", _stop_address(stop), stop["type"])
+                for stop_key, stop in chosen_candidate["routes"].items()
+            ]
+
+            entries, skipped_stops = [], []
+            for key, label, popup_address, marker_type in stops_to_plot:
+                location = locations.get(key)
+                if location is None:
+                    skipped_stops.append(label)
+                    continue
+                lon, lat = location
+                entries.append(
+                    {"lat": lat, "lon": lon, "label": label, "popup_address": popup_address, "marker_type": marker_type}
+                )
+
+            entries = _spread_duplicate_locations(entries)
+
             route_map = folium.Map(location=[0, 0], zoom_start=2)
             bounds, path = [], []
-
-            origin_lon, origin_lat = geocode_address(chosen_origin["address"])
-            bounds.append((origin_lat, origin_lon))
-            path.append((origin_lat, origin_lon))
-            color, icon = STOP_ICONS["origin"]
-            folium.Marker(
-                [origin_lat, origin_lon],
-                tooltip=f"Start - origin - {chosen_origin_name}",
-                popup=f"<b>Start</b><br>{chosen_origin['address']}",
-                icon=folium.Icon(color=color, icon=icon, prefix="fa"),
-            ).add_to(route_map)
-
-            for stop_key, stop in chosen_candidate["routes"].items():
-                address = _stop_address(stop)
-                lon, lat = geocode_address(address)
+            for entry in entries:
+                lat, lon = entry["lat"], entry["lon"]
                 bounds.append((lat, lon))
                 path.append((lat, lon))
-                color, icon = STOP_ICONS.get(stop["type"], ("gray", "info-sign"))
+                color, icon = STOP_ICONS.get(entry["marker_type"], ("gray", "info-sign"))
                 folium.Marker(
                     [lat, lon],
-                    tooltip=f"Stop {stop_key} - {stop['type']} - {stop['shipment_id']}",
-                    popup=f"<b>Stop {stop_key}</b><br>{address}",
+                    tooltip=entry["label"],
+                    popup=f"<b>{entry['label']}</b><br>{entry['popup_address']}",
                     icon=folium.Icon(color=color, icon=icon, prefix="fa"),
                 ).add_to(route_map)
+
+            if skipped_stops:
+                st.warning(f"No cached coordinates for: {', '.join(skipped_stops)} - omitted from the map.")
 
             folium.PolyLine(path, color="#1a73e8", weight=4, opacity=0.7).add_to(route_map)
             if bounds:
                 route_map.fit_bounds(bounds)
 
             st_folium(route_map, use_container_width=True, height=520, key="route_map")
-        except GeoapifyError as exc:
-            st.warning(f"Couldn't render the map - {exc}")

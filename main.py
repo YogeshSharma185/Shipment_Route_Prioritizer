@@ -19,7 +19,7 @@ from services.route_service import generate_prioritized_route
 
 def build_route(shipments, origins):
     try:
-        travel, skipped_keys, _raw_response = get_travel_matrix(shipments, origins)
+        travel, skipped_keys, _raw_response, _locations = get_travel_matrix(shipments, origins)
     except GeoapifyError as exc:
         print(f"Geoapify request failed: {exc}")
         return {"error": "Unable to generate route"}

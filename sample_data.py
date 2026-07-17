@@ -14,11 +14,18 @@ carries its own "pickup" (address + optional hard time_window) alongside its
 "delivery" (address + optional time_window); a shipment's pickup address is
 completely independent of AVAILABLE_ORIGINS.
 
-Warehouse C's address is deliberately identical to SH005's own pickup address
-- this is the project's worked edge case: a shipment's pickup can itself sit
-at a location that's also a candidate driver origin, but it must always be
-treated as an ordinary pickup stop, never as the selected origin, unless that
-same warehouse is the one actually chosen to start the route from.
+The three origins are deliberately spread far apart from each other and from
+the shipment cluster, while staying within Gurugram (Gurgaon) district
+throughout - Sector 110 to the north (near the city's Delhi-facing edge),
+Bilaspur Chowk to the southwest, Ghata on Sohna Road to the south. These are
+20-30km apart from each other, versus the shipment cluster's own few-km
+span, rather than all sitting close together like the shipment addresses do.
+This makes origin choice actually matter: the origin-to-first-stop leg
+differs enough between candidates to meaningfully change total distance/
+duration, and - since SH006's pickup has a tight 08:00-08:45 deadline
+against a fixed 08:00 departure time - an origin that's simply too far away
+can genuinely fail to reach it in time, producing a real time-window
+violation for that candidate that the others don't have.
 
 Most shipments (7/10) have their own pickup; a few (SH003, SH004, SH010)
 don't - delivery-only, exactly like a single-location shipment. Between
@@ -28,16 +35,19 @@ them, every time-window combination is covered:
   - only a pickup window    -> SH008
   - neither window          -> SH004, SH007 (pickup present, no window on either side)
 
-All addresses are real, verified places in Gurugram (Gurgaon), Haryana -
-each one geocodes correctly and stays within Gurugram (checked against the
-live Geoapify geocoder). Every AVAILABLE_ORIGINS / pickup address below
+All shipment pickup/delivery addresses are real, verified places in Gurugram
+(Gurgaon), Haryana - each one geocodes correctly and stays within Gurugram
+(checked against the live Geoapify geocoder); every pickup address below
 reuses one of these verified addresses rather than introducing new ones.
+AVAILABLE_ORIGINS addresses are separately verified real Gurugram places too,
+chosen specifically to sit far outside that cluster (see above) while
+staying within the same district.
 """
 
 AVAILABLE_ORIGINS = [
-    {"name": "Warehouse A", "address": "Udyog Vihar Phase 1, Gurugram, Haryana 122016"},
-    {"name": "Warehouse B", "address": "DLF Cyber Greens, Sector 25A, Gurugram, Haryana 122002"},
-    {"name": "Warehouse C", "address": "Vatika Chowk, Sector 48, Sohna Road, Gurugram, Haryana 122018"},
+    {"name": "Warehouse A", "address": "Sector 110, Gurugram, Haryana 122017"},
+    {"name": "Warehouse B", "address": "Bilaspur Chowk, Gurugram, Haryana 122413"},
+    {"name": "Warehouse C", "address": "Ghata, Sohna Road, Gurugram, Haryana 122102"},
 ]
 
 SAMPLE_SHIPMENTS = [

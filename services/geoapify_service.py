@@ -101,7 +101,7 @@ def get_travel_matrix(shipments: list, origins: list) -> tuple:
     """Geocode every origin/pickup/delivery point (once per distinct address)
     and return real drive distance/time between every pair of them.
 
-    Returns (travel, skipped_keys, raw_response):
+    Returns (travel, skipped_keys, raw_response, locations):
       - travel: {(from_key, to_key): {"distance": meters, "time": seconds}}
         for every pair of successfully-geocoded points.
       - skipped_keys: the set of point keys whose address couldn't be
@@ -111,6 +111,10 @@ def get_travel_matrix(shipments: list, origins: list) -> tuple:
         and drops any *origin* that lands in here from candidate evaluation.
       - raw_response: the unmodified JSON Geoapify's Matrix API returned -
         the same single response covers every origin's candidate route.
+      - locations: {key: [lon, lat]} for every successfully-geocoded point -
+        the exact coordinates already fetched to build the matrix, kept
+        around so callers (e.g. the map UI) can plot points without
+        re-geocoding the same addresses again on every render.
 
     Raises GeoapifyError only if nothing at all could be geocoded, or the
     Matrix API call itself fails.
@@ -154,4 +158,6 @@ def get_travel_matrix(shipments: list, origins: list) -> tuple:
                 continue
             travel[(from_key, to_key)] = matrix[i][j]
 
-    return travel, skipped_keys, raw_response
+    locations = dict(geocoded)
+
+    return travel, skipped_keys, raw_response, locations

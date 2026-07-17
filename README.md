@@ -135,15 +135,20 @@ between instantly:
 
 ## Sample input
 
-`sample_data.py` uses real, verified locations in Gurugram (Gurgaon),
-Haryana. `AVAILABLE_ORIGINS` is the driver's fixed set of candidate starting
-warehouses:
+`sample_data.py` uses real, verified Gurugram (Gurgaon) locations throughout.
+`AVAILABLE_ORIGINS` is the driver's fixed set of candidate starting
+warehouses - deliberately spread 20-30km apart from each other and from the
+shipment cluster (Sector 110 to the north, Bilaspur Chowk to the southwest,
+Ghata on Sohna Road to the south), while staying within the same district,
+rather than sitting a few km apart like the shipments do. This makes origin
+choice visibly change total distance/duration (and, if a shipment's deadline
+were tighter, could even change which candidates are still feasible at all):
 
 ```python
 AVAILABLE_ORIGINS = [
-    {"name": "Warehouse A", "address": "Udyog Vihar Phase 1, Gurugram, Haryana 122016"},
-    {"name": "Warehouse B", "address": "DLF Cyber Greens, Sector 25A, Gurugram, Haryana 122002"},
-    {"name": "Warehouse C", "address": "Vatika Chowk, Sector 48, Sohna Road, Gurugram, Haryana 122018"},
+    {"name": "Warehouse A", "address": "Sector 110, Gurugram, Haryana 122017"},
+    {"name": "Warehouse B", "address": "Bilaspur Chowk, Gurugram, Haryana 122413"},
+    {"name": "Warehouse C", "address": "Ghata, Sohna Road, Gurugram, Haryana 122102"},
 ]
 ```
 
@@ -169,17 +174,20 @@ Between the 10 sample shipments:
   SH003, SH009, SH010. **Only a pickup window** - SH008. **Neither window** -
   SH004 (no pickup at all) and SH007 (has a pickup address, but no window on
   either side).
-- **The worked edge case**: SH005's own pickup address ("Vatika Chowk, Sector
-  48, Sohna Road...") is *identical* to Warehouse C's address. Whichever
-  origin ends up selected, SH005 always shows up as an ordinary `"pickup"`
-  stop at that address - it only becomes the route's `"origin"` stop on the
-  run where Warehouse C itself is the one actually selected.
+
+All shipment pickup/delivery addresses are real, verified places that stay
+within Gurugram, deliberately clustered close together (a few km apart) -
+unlike `AVAILABLE_ORIGINS`, which is deliberately spread far outside that
+cluster (see "Sample input" above). A shipment's own pickup address is still
+completely independent of `AVAILABLE_ORIGINS` either way - it's never treated
+as anything but an ordinary pickup stop, regardless of how close or far it
+happens to be from any candidate origin.
 
 ## Sample output
 
 ```json
 {
-  "selected_origin": "Warehouse B (DLF Cyber Greens, Sector 25A, Gurugram, Haryana 122002)",
+  "selected_origin": "Warehouse A (Sector 110, Gurugram, Haryana 122017)",
   "routes": {
     "001": {"pickup_address": "DLF Cyber Hub, DLF Cyber City, Sector 24, Gurugram, Haryana 122002", "delivery_address": "HUDA City Centre, Sector 29, Gurugram, Haryana 122001", "shipment_id": "SH006", "type": "pickup"},
     "002": {"pickup_address": "Sector 14 Market, Sector 14, Gurugram, Haryana 122001", "delivery_address": "Vatika Chowk, Sector 48, Sohna Road, Gurugram, Haryana 122018", "shipment_id": "SH008", "type": "pickup"},
@@ -199,8 +207,8 @@ Between the 10 sample shipments:
     "016": {"pickup_address": "Sector 14 Market, Sector 14, Gurugram, Haryana 122001", "delivery_address": "Vatika Chowk, Sector 48, Sohna Road, Gurugram, Haryana 122018", "shipment_id": "SH008", "type": "delivery"},
     "017": {"pickup_address": null, "delivery_address": "Sector 14 Market, Sector 14, Gurugram, Haryana 122001", "shipment_id": "SH004", "type": "delivery"}
   },
-  "total_miles": 93.18,
-  "total_duration": "3h"
+  "total_miles": 98.08,
+  "total_duration": "3h 9m"
 }
 ```
 
@@ -211,9 +219,17 @@ estimates between calls, and the origin comparison is sensitive to those
 numbers when candidates are close. The stop *order within* a given origin's
 route is fully deterministic given the same input data and travel numbers.)
 
-Here Warehouse B won because all three candidate origins had zero time-window
+Here Warehouse A won because all three candidate origins had zero time-window
 violations, so the tie went to whichever had the lowest total travel time
-(see "Origin selection" below for the exact comparison rule).
+(see "Origin selection" below for the exact comparison rule). Note that the
+stop *order* (`"001"` onward) is identical no matter which origin wins -
+that's expected for this dataset, not a bug: each stop's priority group/
+anchor/duration already decides almost every position outright, and the one
+real tie (SH001 vs. SH005's delivery, both 11:00-13:00) gets broken by
+distance from the previous *stop*, not the origin - so the origin only ever
+affects the origin-to-first-stop leg and the resulting totals, which is
+exactly why those numbers now vary meaningfully between candidates while the
+sequence itself doesn't.
 
 Note that `"selected_origin"` is the only place `"origin"` means anything in
 this output - it's metadata, not a numbered stop, and `"001"` is the first
