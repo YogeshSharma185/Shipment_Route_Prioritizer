@@ -1,13 +1,15 @@
 """Everything related to talking to Geoapify: geocoding addresses and getting
 real drive distances/times between them. This module has one job: turn
 addresses into facts (coordinates, pairwise travel time/distance). It does
-not decide what order to visit stops in or validate shipment data - that's
-route_service.py's job.
+not decide what order to visit stops in, which origin is best, or validate
+shipment data - that's route_service.py's job.
 
-Each shipment carries its own pickup point (a specific warehouse origin) and
-delivery point, so "what order to visit stops in" is a sequencing problem
-route_service.py solves itself. The only thing asked of Geoapify here is a
-travel-time matrix between every point that could appear in a route.
+Each shipment carries its own optional pickup point and mandatory delivery
+point, and the driver has a separate list of candidate starting origins
+(warehouses) - route_service.py evaluates every origin and decides sequencing
+and origin selection itself. The only thing asked of Geoapify here is a
+single travel-time matrix covering every point that could appear in any
+candidate route: every origin, plus every shipment pickup/delivery.
 """
 import requests
 
@@ -39,14 +41,19 @@ def geocode_address(address: str) -> list:
     return [top_match["lon"], top_match["lat"]]
 
 
-def _collect_points(shipments: list) -> list:
-    """List every (key, address) pair that needs a location: one per shipment
-    pickup (if it has one - each shipment's own pickup.address is that
-    shipment's specific warehouse origin) and one per shipment delivery. key
-    is a (kind, id) tuple used to look distances back up later -
-    ("pickup", shipment_id) / ("delivery", shipment_id).
+def _collect_points(shipments: list, origins: list) -> list:
+    """List every (key, address) pair that needs a location: one per
+    candidate driver origin, one per shipment pickup (if it has one), and one
+    per shipment delivery. key is a (kind, id) tuple used to look distances
+    back up later - ("origin", origin_name) / ("pickup", shipment_id) /
+    ("delivery", shipment_id). Origins ride the same point list as shipment
+    stops so a single Matrix API call below covers every candidate route.
     """
     points = []
+    for origin in origins or []:
+        if isinstance(origin, dict) and origin.get("name"):
+            points.append((("origin", origin["name"]), origin.get("address")))
+
     for shipment in shipments:
         if not isinstance(shipment, dict):
             continue
@@ -90,24 +97,25 @@ def _call_matrix_api(locations: list) -> tuple:
     return matrix, raw_response
 
 
-def get_travel_matrix(shipments: list) -> tuple:
-    """Geocode every pickup/delivery point (once per distinct address) and
-    return real drive distance/time between every pair of them.
+def get_travel_matrix(shipments: list, origins: list) -> tuple:
+    """Geocode every origin/pickup/delivery point (once per distinct address)
+    and return real drive distance/time between every pair of them.
 
     Returns (travel, skipped_keys, raw_response):
       - travel: {(from_key, to_key): {"distance": meters, "time": seconds}}
         for every pair of successfully-geocoded points.
       - skipped_keys: the set of point keys whose address couldn't be
-        geocoded (missing address, or Geoapify couldn't resolve it) - mirrors
-        the old _build_jobs behaviour of skipping bad addresses here so one
-        unresolvable stop doesn't fail the whole request; route_service.py
-        treats any *valid* shipment that lands in here as an unusable route.
-      - raw_response: the unmodified JSON Geoapify's Matrix API returned.
+        geocoded (missing address, or Geoapify couldn't resolve it) - one
+        unresolvable stop doesn't fail the whole request. route_service.py
+        treats any *valid* shipment that lands in here as an unusable route,
+        and drops any *origin* that lands in here from candidate evaluation.
+      - raw_response: the unmodified JSON Geoapify's Matrix API returned -
+        the same single response covers every origin's candidate route.
 
     Raises GeoapifyError only if nothing at all could be geocoded, or the
     Matrix API call itself fails.
     """
-    points = _collect_points(shipments)
+    points = _collect_points(shipments, origins)
 
     address_cache = {}
     geocoded = []

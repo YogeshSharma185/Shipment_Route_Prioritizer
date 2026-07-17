@@ -15,6 +15,12 @@ def seconds_since_midnight(value: time) -> int:
     return value.hour * 3600 + value.minute * 60
 
 
+def format_clock(seconds: int) -> str:
+    """Inverse of seconds_since_midnight: format seconds-since-midnight back into 'HH:MM'."""
+    total_minutes = (seconds // 60) % (24 * 60)
+    return f"{total_minutes // 60:02d}:{total_minutes % 60:02d}"
+
+
 def meters_to_miles(meters: float) -> float:
     return round(meters / METERS_PER_MILE, 2)
 
