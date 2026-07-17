@@ -235,7 +235,7 @@ with st.sidebar:
     elif st.session_state.get("error"):
         st.error("Last run failed - see the Prioritized Route page.")
     else:
-        st.info("Click **Generate** to run the pipeline.")
+        st.info("Click **Generate Prioritized Route** to run the pipeline.")
 
     st.divider()
     page = st.radio("View", PAGES, key="page", label_visibility="collapsed")
